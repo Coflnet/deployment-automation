@@ -9,31 +9,24 @@
 # enable_tls: when true, adds the tls template to the /etc/redpanda/redpanda.yml file
 # advertise_public_ips : causes the cluster to set a public ip on advertised_kafka_api, allowing access to the cluster from the public internet
 ---
-- name: Provision tls cluster
+- name: Add extra kafka broker certs
   hosts: redpanda
   vars:
-    root_ca_dir: "{{ playbook_dir }}/tls/ca"
+    root_ca_dir: "{{ playbook_dir }}/tls/ca_kafka"
+    file_suffix: "_kafka"
+    redpanda_certs_dir: "/etc/redpanda/certs"
+    redpanda_csr_file: "{{ redpanda_certs_dir }}/node{{ file_suffix }}.csr"
+   # redpanda_key_file: "{{ redpanda_certs_dir }}/node.key" # is same
+    redpanda_cert_file: "{{ redpanda_certs_dir }}/node{{ file_suffix }}.crt"
+    redpanda_truststore_file: "{{ redpanda_certs_dir }}/truststore{{ file_suffix }}.pem"
     enable_tls: true
     advertise_public_ips: true
     create_demo_certs: true
     handle_cert_install: true
     redpanda_version: latest
-    ca_cert_file: "tls/ca/ca.crt"
-    node_cert_file: "tls/certs/{{ansible_hostname}}/node.crt"
+    ca_cert_file: "tls/ca/ca_kafka.crt"
+    node_cert_file: "tls/certs/{{ansible_hostname}}/node_kafka.crt"
   tasks:
     - name: Install and configure CA certs for running tls
       ansible.builtin.include_role:
         name: redpanda.cluster.demo_certs
-    - name: Install system prereqs
-      ansible.builtin.include_role:
-        name: redpanda.cluster.sysctl_setup
-    - name: Install system prereqs
-      ansible.builtin.include_role:
-        name: redpanda.cluster.system_setup
-    - name: Handle sysctl changes
-      ansible.builtin.include_role:
-        name: redpanda.cluster.sysctl_setup
-    - name: Install and start redpanda
-      ansible.builtin.include_role:
-        name: redpanda.cluster.redpanda_broker
-      when: not skip_node | default(false) | bool
