@@ -118,3 +118,33 @@ correctness.
 Breaks the play because intermediate commands in the pipe return nonzero (but irrelevant) error codes
 
 - risky-shell-pipe 
+
+
+## Create self signed certificate for consumer
+  
+  ```shell
+  openssl req -new -newkey rsa:2048 -nodes -keyout skyblock.key -out skyblock.csr -subj "/CN=sky.coflnet.com"
+  openssl ca -config ansible/tls/ca/ca.conf -keyfile ansible/tls/ca_kafka/ca.key -cert ansible/tls/ca_kafka/ca.crt -policy signing_policy -extensions signing_node_req -in skyblock.csr -out skyblock.crt -outdir . -batch
+  ```
+
+## Basic SASL setup
+For detailed instructions see [redpanda university](https://university.redpanda.com/courses/take/hands-on-redpanda-cluster-operations/texts/39071127-lesson-iv-access-management)
+```shell
+admin_password=$(head -c 16  /dev/random | md5sum | cut -f 1 -d\ )
+rpk cluster config set enable_sasl true
+# create admin
+rpk acl user create admin --password $admin_password
+rpk cluster config set superusers '[admin]'
+echo "admin_password: $admin_password"
+```
+### Create and authorize user for namespace
+```shell
+# don't forget to set the admin_password="pwd"
+user_name=skyblock
+prefix=sky # prefix of the topics will be extended with a dash (-) to create namespaces
+user_password=$(head -c 16  /dev/random | md5sum | cut -f 1 -d\ )
+rpk acl user create $user_name --password $user_password
+# uses kafka api
+rpk acl create --allow-host '*' --operation all --user admin --password $admin_password --sasl-mechanism SCRAM-SHA-256 --topic "$prefix-" --group "$prefix-" --resource-pattern-type prefixed --allow-principal User:$user_name
+echo "user_password: $user_password"
+```
