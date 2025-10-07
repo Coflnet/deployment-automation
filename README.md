@@ -150,6 +150,9 @@ echo "user_password: $user_password"
 ```
 
 
+## Coflnet Setup
+We applied some patches to the playbook so to replicate the setup clone https://github.com/Coflnet/redpanda-ansible-cluster.git into `~/.ansible/collections/ansible_collections/redpanda/cluster`
+
 ## Update (day)
 update `redpanda_version` in `ansible/provision-cluster-tls.yml` keep the `-1` suffix as thats default on debian for package updates.
 Then run
