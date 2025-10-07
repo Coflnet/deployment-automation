@@ -37,7 +37,7 @@
     create_demo_certs: true
     file_suffix: ""
     handle_cert_install: true
-    redpanda_version: latest
+    redpanda_version: "25.2.7-1"
     ca_cert_file: "tls/ca/ca.crt"
     ca_kafka_cert_file: "tls/ca_kafka/ca.crt"
     node_cert_file: "tls/certs/{{ansible_hostname}}/node.crt"

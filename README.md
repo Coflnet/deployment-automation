@@ -148,3 +148,11 @@ rpk acl user create $user_name --password $user_password
 rpk acl create --allow-host '*' --operation all --user admin --password $admin_password --sasl-mechanism SCRAM-SHA-256 --topic "$prefix-" --group "$prefix-" --resource-pattern-type prefixed --allow-principal User:$user_name
 echo "user_password: $user_password"
 ```
+
+
+## Update (day)
+update `redpanda_version` in `ansible/provision-cluster-tls.yml` keep the `-1` suffix as thats default on debian for package updates.
+Then run
+```
+ansible-playbook --private-key ~/.ssh/id_rsa -i artifacts/hosts.ini -v ./ansible/provision-cluster-tls.yml 
+```
