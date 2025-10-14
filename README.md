@@ -123,7 +123,8 @@ Breaks the play because intermediate commands in the pipe return nonzero (but ir
 ## Create self signed certificate for consumer
   
   ```shell
-  openssl req -new -newkey rsa:2048 -nodes -keyout skyblock.key -out skyblock.csr -subj "/CN=sky.coflnet.com"
+  openssl req -new -newkey rsa:2048 -nodes -keyout skyblock.key -out skyblock.csr -subj "/CN=sky.coflnet.com/O=Coflnet"
+  
   openssl ca -config ansible/tls/ca/ca.conf -keyfile ansible/tls/ca_kafka/ca.key -cert ansible/tls/ca_kafka/ca.crt -policy signing_policy -extensions signing_node_req -in skyblock.csr -out skyblock.crt -outdir . -batch
   ```
 
