@@ -1,0 +1,26 @@
+---
+- name: Use the migrated Redpanda Debian repository
+  ansible.builtin.set_fact:
+    rp_key_deb: https://linux.pkg.redpanda.com/redpanda-deb-signing-public.gpg
+    rp_key_path_deb: /usr/share/keyrings/artifact-registry.gpg
+    rp_repo_signing_deb: "deb [signed-by=/usr/share/keyrings/artifact-registry.gpg] https://linux.pkg.redpanda.com/apt redpanda-apt main"
+
+- name: Find retired Redpanda Debian repository entries
+  ansible.builtin.find:
+    paths: /etc/apt
+    recurse: true
+    patterns:
+      - sources.list
+      - '*.list'
+    contains: '^[ \t]*deb(?:-src)?[ \t]+(?:\[[^\]\r\n]*\][ \t]+)?https://dl\.redpanda\.com/public/redpanda/'
+  register: redpanda_legacy_deb_sources
+
+- name: Disable retired Redpanda Debian repository entries
+  become: true
+  ansible.builtin.replace:
+    path: "{{ item.path }}"
+    regexp: '^([ \t]*deb(?:-src)?[ \t]+(?:\[[^\]\r\n]*\][ \t]+)?https://dl\.redpanda\.com/public/redpanda/[^\r\n]*)$'
+    replace: '# \1'
+  loop: "{{ redpanda_legacy_deb_sources.files }}"
+  loop_control:
+    label: "{{ item.path }}"

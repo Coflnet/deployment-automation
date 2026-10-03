@@ -22,6 +22,10 @@
     ca_cert_file: "tls/ca/ca.crt"
     node_cert_file: "tls/certs/{{ansible_hostname}}/node.crt"
     cloud_storage_credentials_source: "aws_instance_metadata"
+  pre_tasks:
+    - name: Repair Redpanda DEB repository
+      ansible.builtin.import_tasks: tasks/redpanda-deb-repository.yml
+      when: ansible_os_family == "Debian"
   tasks:
     - name: Install and configure CA certs for running tls
       ansible.builtin.include_role:

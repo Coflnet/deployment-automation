@@ -1,0 +1,20 @@
+---
+- name: Wait for healthy membership and complete replication
+  ansible.builtin.uri:
+    url: "https://{{ inventory_hostname }}:9644/v1/cluster/health_overview"
+    ca_path: /etc/redpanda/certs/truststore.pem
+    client_cert: /etc/redpanda/certs/node.crt
+    client_key: /etc/redpanda/certs/node.key
+    return_content: true
+  register: cluster_health
+  until: >-
+    cluster_health.status | default(0) == 200
+    and cluster_health.json.is_healthy | default(false)
+    and cluster_health.json.all_nodes | default([]) | length == groups['redpanda'] | length
+    and cluster_health.json.nodes_down | default([0]) | length == 0
+    and cluster_health.json.nodes_in_recovery_mode | default([0]) | length == 0
+    and cluster_health.json.high_disk_usage_nodes | default([0]) | length == 0
+    and cluster_health.json.leaderless_count | default(-1) == 0
+    and cluster_health.json.under_replicated_count | default(-1) == 0
+  retries: 60
+  delay: 15

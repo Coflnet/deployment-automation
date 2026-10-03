@@ -37,11 +37,15 @@
     create_demo_certs: true
     file_suffix: ""
     handle_cert_install: true
-    redpanda_version: "25.2.7-1"
+    redpanda_version: "26.2.3-1"
     ca_cert_file: "tls/ca/ca.crt"
     ca_kafka_cert_file: "tls/ca_kafka/ca.crt"
     node_cert_file: "tls/certs/{{ansible_hostname}}/node.crt"
     node_kafka_cert_file: "tls/certs/{{ansible_hostname}}/node_kafka.crt"
+  pre_tasks:
+    - name: Repair Redpanda DEB repository
+      ansible.builtin.import_tasks: tasks/redpanda-deb-repository.yml
+      when: ansible_os_family == "Debian"
   tasks:
     - name: Install and configure CA certs for running tls
       ansible.builtin.include_role:

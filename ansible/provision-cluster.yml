@@ -7,6 +7,10 @@
   vars:
     advertise_public_ips: true
     redpanda_version: latest
+  pre_tasks:
+    - name: Repair Redpanda DEB repository
+      ansible.builtin.import_tasks: tasks/redpanda-deb-repository.yml
+      when: ansible_os_family == "Debian"
   tasks:
     - name: Install system prereqs
       ansible.builtin.include_role:

@@ -155,8 +155,15 @@ echo "user_password: $user_password"
 We applied some patches to the playbook so to replicate the setup clone https://github.com/Coflnet/redpanda-ansible-cluster.git into `~/.ansible/collections/ansible_collections/redpanda/cluster`
 
 ## Update (day)
-update `redpanda_version` in `ansible/provision-cluster-tls.yml` keep the `-1` suffix as thats default on debian for package updates.
-Then run
+
+For an existing TLS cluster, run the rolling patch upgrade playbook:
+
+```shell
+ansible-playbook --private-key ~/.ssh/id_rsa -i artifacts/hosts.ini ./ansible/upgrade-cluster.yml
 ```
-ansible-playbook --private-key ~/.ssh/id_rsa -i artifacts/hosts.ini -v ./ansible/provision-cluster-tls.yml 
-```
+
+The default target is `26.2.3-1`. Set `-e redpanda_version=<version>-1` for another patch on the current feature branch. The preflight checks every selected broker and rejects downgrades, feature-release changes, unhealthy membership, incomplete replication, and restart risks. Use `--tags preflight` to run only these read-only checks.
+
+The upgrade repairs the Debian/Ubuntu repository automatically, saves the existing configuration and rollback packages under `/var/backups/redpanda-upgrade-<version>/`, and downloads the new packages before draining the broker. It upgrades one broker at a time, verifies readiness and the running version, exits maintenance mode, and waits for complete replication before continuing. Any failure stops the run; recover and verify that broker before rerunning with `--limit <broker>` or proceeding to another broker. Node configuration and certificates are verified unchanged.
+
+For initial provisioning, keep `redpanda_version` in `ansible/provision-cluster-tls.yml` aligned with the installed version, including the Debian `-1` suffix.

@@ -1,0 +1,221 @@
+---
+- name: Check every broker before the patch upgrade
+  hosts: redpanda
+  tags: preflight
+  become: true
+  any_errors_fatal: true
+  vars:
+    redpanda_version: "26.2.3-1"
+  tasks:
+    - name: Require a consistent package database
+      ansible.builtin.command: dpkg --audit
+      register: package_audit
+      changed_when: false
+      failed_when: package_audit.rc != 0 or package_audit.stdout | length > 0
+
+    - name: Read installed broker version
+      ansible.builtin.command: dpkg-query -W -f=${Version} redpanda
+      register: installed_redpanda
+      changed_when: false
+
+    - name: Record existing node configuration and certificates
+      ansible.builtin.command:
+        argv: [sha256sum, /etc/redpanda/redpanda.yaml, /etc/default/redpanda, /etc/redpanda/certs/node.crt, /etc/redpanda/certs/node_kafka.crt, /etc/redpanda/certs/truststore.pem, /etc/redpanda/certs/truststore_kafka.pem]
+      register: original_configuration
+      changed_when: false
+
+    - name: Require an explicit forward patch on the current feature branch
+      ansible.builtin.assert:
+        that:
+          - redpanda_version is match('^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$')
+          - installed_redpanda.stdout is match('^[0-9]+\.[0-9]+\.[0-9]+-[0-9]+$')
+          - redpanda_version.split('.')[:2] == installed_redpanda.stdout.split('.')[:2]
+
+    - name: Reject a Debian package downgrade
+      ansible.builtin.command:
+        argv: [dpkg, --compare-versions, "{{ redpanda_version }}", ge, "{{ installed_redpanda.stdout }}"]
+      changed_when: false
+
+    - name: Read broker identity
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9644/v1/node_config"
+        ca_path: /etc/redpanda/certs/truststore.pem
+        client_cert: /etc/redpanda/certs/node.crt
+        client_key: /etc/redpanda/certs/node.key
+        return_content: true
+      register: node_config
+
+    - name: Preserve broker identity for the rolling upgrade
+      ansible.builtin.set_fact:
+        upgrade_node_id: "{{ node_config.json.node_id }}"
+
+    - name: Read current broker membership and running versions
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9644/v1/brokers"
+        ca_path: /etc/redpanda/certs/truststore.pem
+        client_cert: /etc/redpanda/certs/node.crt
+        client_key: /etc/redpanda/certs/node.key
+      register: initial_brokers
+
+    - name: Require active brokers outside maintenance
+      ansible.builtin.assert:
+        that:
+          - initial_brokers.json | length == groups['redpanda'] | length
+          - initial_brokers.json | selectattr('is_alive', 'equalto', true) | list | length == initial_brokers.json | length
+          - initial_brokers.json | selectattr('membership_status', 'equalto', 'active') | list | length == initial_brokers.json | length
+          - initial_brokers.json | selectattr('maintenance_status.draining', 'equalto', true) | list | length == 0
+
+    - name: Preserve the current running version
+      ansible.builtin.set_fact:
+        upgrade_running_version: "{{ (initial_brokers.json | selectattr('node_id', 'equalto', upgrade_node_id | int) | first).version }}"
+
+    - name: Read pre-restart risks
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9644/v1/broker/pre_restart_probe"
+        ca_path: /etc/redpanda/certs/truststore.pem
+        client_cert: /etc/redpanda/certs/node.crt
+        client_key: /etc/redpanda/certs/node.key
+        return_content: true
+      register: restart_probe
+
+    - name: Require no pre-restart risks
+      ansible.builtin.assert:
+        that:
+          - restart_probe.json.risks.values() | map('length') | sum == 0
+
+    - name: Require a healthy cluster before any upgrade
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+- name: Upgrade one broker and wait for full recovery
+  hosts: redpanda
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars:
+    redpanda_version: "26.2.3-1"
+  tasks:
+    - name: Require a healthy cluster before taking this broker out of service
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Repair Redpanda DEB repository
+      ansible.builtin.import_tasks: tasks/redpanda-deb-repository.yml
+
+    - name: Configure the migrated Redpanda repository
+      ansible.builtin.include_role:
+        name: redpanda.cluster.redpanda_broker
+        tasks_from: configure-deb-repository.yml
+
+    - name: Prepare a protected rollback directory
+      ansible.builtin.file:
+        path: "/var/backups/redpanda-upgrade-{{ redpanda_version }}"
+        state: directory
+        mode: "0700"
+
+    - name: Back up the existing node configuration and certificates
+      ansible.builtin.command:
+        argv: [tar, -cf, "/var/backups/redpanda-upgrade-{{ redpanda_version }}/configuration.tar", -C, /etc, redpanda, default/redpanda]
+        creates: "/var/backups/redpanda-upgrade-{{ redpanda_version }}/configuration.tar"
+
+    - name: Refresh signed package metadata
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Download and verify the patch packages before draining
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - --download-only
+          - --assume-yes
+          - --no-remove
+          - install
+          - "redpanda={{ redpanda_version }}"
+          - "redpanda-rpk={{ redpanda_version }}"
+          - "redpanda-tuner={{ redpanda_version }}"
+
+    - name: Cache the current packages for a patch rollback
+      ansible.builtin.command:
+        argv:
+          - apt-get
+          - download
+          - "redpanda={{ installed_redpanda.stdout }}"
+          - "redpanda-rpk={{ installed_redpanda.stdout }}"
+          - "redpanda-tuner={{ installed_redpanda.stdout }}"
+        chdir: "/var/backups/redpanda-upgrade-{{ redpanda_version }}"
+
+    - name: Drain this broker before package scripts can restart it
+      ansible.builtin.command:
+        argv: [timeout, 900, rpk, cluster, maintenance, enable, "{{ upgrade_node_id }}", --wait]
+
+    - name: Confirm cluster health after leadership drains
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Install the exact Redpanda patch packages
+      ansible.builtin.apt:
+        name:
+          - "redpanda={{ redpanda_version }}"
+          - "redpanda-rpk={{ redpanda_version }}"
+          - "redpanda-tuner={{ redpanda_version }}"
+        state: present
+        allow_downgrade: false
+        policy_rc_d: 101
+      register: upgraded_packages
+      environment:
+        NEEDRESTART_MODE: l
+
+    - name: Restart this broker into the installed patch
+      ansible.builtin.systemd:
+        name: redpanda
+        state: restarted
+        daemon_reload: true
+      when: >-
+        upgraded_packages.changed or not (upgrade_running_version is match('^v' ~ (redpanda_version.split('-')[0] | regex_escape) ~ '(?: |$)'))
+
+    - name: Wait for local readiness
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9644/v1/status/ready"
+        ca_path: /etc/redpanda/certs/truststore.pem
+        client_cert: /etc/redpanda/certs/node.crt
+        client_key: /etc/redpanda/certs/node.key
+        return_content: true
+      register: broker_ready
+      until: broker_ready.status | default(0) == 200 and broker_ready.json.status | default('') == 'ready'
+      retries: 60
+      delay: 15
+
+    - name: Wait for live membership with the target binary
+      ansible.builtin.uri:
+        url: "https://{{ inventory_hostname }}:9644/v1/brokers"
+        ca_path: /etc/redpanda/certs/truststore.pem
+        client_cert: /etc/redpanda/certs/node.crt
+        client_key: /etc/redpanda/certs/node.key
+        return_content: true
+      register: broker_membership
+      vars:
+        this_broker: "{{ broker_membership.json | default([]) | selectattr('node_id', 'equalto', upgrade_node_id | int) | list }}"
+      until: >-
+        this_broker | length == 1 and this_broker[0].is_alive | default(false)
+        and this_broker[0].membership_status == 'active'
+        and this_broker[0].version is match('^v' ~ (redpanda_version.split('-')[0] | regex_escape) ~ '(?: |$)')
+      retries: 60
+      delay: 15
+
+    - name: Return the recovered broker to service
+      ansible.builtin.command:
+        argv: [rpk, cluster, maintenance, disable, "{{ upgrade_node_id }}"]
+
+    - name: Wait for full cluster recovery before the next broker
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Verify existing node configuration and certificates
+      ansible.builtin.command:
+        argv: [sha256sum, /etc/redpanda/redpanda.yaml, /etc/default/redpanda, /etc/redpanda/certs/node.crt, /etc/redpanda/certs/node_kafka.crt, /etc/redpanda/certs/truststore.pem, /etc/redpanda/certs/truststore_kafka.pem]
+      register: recovered_configuration
+      changed_when: false
+      failed_when: recovered_configuration.stdout != original_configuration.stdout
+
+    - name: Observe the recovered broker before proceeding
+      ansible.builtin.pause:
+        seconds: 30
+
+    - name: Confirm cluster health after observation
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
