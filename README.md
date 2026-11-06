@@ -167,3 +167,26 @@ The default target is `26.2.3-1`. Set `-e redpanda_version=<version>-1` for anot
 The upgrade repairs the Debian/Ubuntu repository automatically, saves the existing configuration and rollback packages under `/var/backups/redpanda-upgrade-<version>/`, and downloads the new packages before draining the broker. It upgrades one broker at a time, verifies readiness and the running version, exits maintenance mode, and waits for complete replication before continuing. Any failure stops the run; recover and verify that broker before rerunning with `--limit <broker>` or proceeding to another broker. Node configuration and certificates are verified unchanged.
 
 For initial provisioning, keep `redpanda_version` in `ansible/provision-cluster-tls.yml` aligned with the installed version, including the Debian `-1` suffix.
+
+## Dedicated client access (certificate + SCRAM user + prefix ACLs)
+
+Scripted version of the two sections above, for long-lived external clients such as
+cait's Mimir. Keys and passwords land in the git-ignored `clients/<name>/` and never
+appear in argv or output.
+
+```shell
+# 1. 2-year client certificate from ansible/tls/ca_kafka (CN=<name>, O=Coflnet, clientAuth, EC P-256)
+scripts/kafka-client/issue-client-cert.sh cait-mimir 730
+# 2. SCRAM-SHA-256 user via the admin API (node certificate, no admin password needed)
+scripts/kafka-client/create-scram-user.sh cait-mimir
+# 3. Owner: pre-create the topic (3 partitions = one per ingester, RF 3, 16 MB messages, 24 h, 50 GB per broker
+#    via BUDGET_BYTES) and add prefixed ACLs (topic read/write/describe, group read/describe).
+#    Prompts for the admin SASL password.
+scripts/kafka-client/grant-prefix-access.sh cait-mimir cait-mimir- cait-mimir-ingest 3
+```
+
+The user gets no `create` ACL, so a client cannot add topics that bypass the disk budget;
+run it with topic auto-creation off. Each issued certificate's `receipt.txt` holds
+`not_after_epoch` for the expiry alert (Fleet `prometheus-rules/kafka-client-cert-expiry-rules.yaml`).
+Renew before expiry by issuing a new certificate (new dated folder), hand it over, then
+update the alert's timestamp.
