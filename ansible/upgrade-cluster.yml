@@ -6,6 +6,15 @@
   any_errors_fatal: true
   vars:
     redpanda_version: "26.2.3-1"
+  vars_files: &admin_api_vars
+    - vars/redpanda-admin-api.yml
+  # With admin_api_require_auth=true, /v1/brokers and /v1/node_config need the admin
+  # login as basic auth; it is sent only when secrets/redpanda-admin-password exists.
+  module_defaults: &admin_api_auth
+    ansible.builtin.uri:
+      url_username: "{{ redpanda_admin_user if redpanda_admin_basic_auth else omit }}"
+      url_password: "{{ lookup('ansible.builtin.file', redpanda_admin_password_path) if redpanda_admin_basic_auth else omit }}"
+      force_basic_auth: "{{ redpanda_admin_basic_auth }}"
   tasks:
     - name: Require a consistent package database
       ansible.builtin.command: dpkg --audit
@@ -93,6 +102,8 @@
   any_errors_fatal: true
   vars:
     redpanda_version: "26.2.3-1"
+  vars_files: *admin_api_vars
+  module_defaults: *admin_api_auth
   tasks:
     - name: Require a healthy cluster before taking this broker out of service
       ansible.builtin.include_tasks: tasks/redpanda-health.yml

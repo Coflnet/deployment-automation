@@ -154,6 +154,115 @@ echo "user_password: $user_password"
 ## Coflnet Setup
 We applied some patches to the playbook so to replicate the setup clone https://github.com/Coflnet/redpanda-ansible-cluster.git into `~/.ansible/collections/ansible_collections/redpanda/cluster`
 
+## Admin API hardening
+
+`truststore.pem` (admin API 9644, schema registry 8081, REST proxy 8082, internode RPC)
+also trusts the shared `Coflnet Internal Root CA`, whose online intermediates issue many
+clientAuth leaves. `ansible/harden-admin-auth.yml --tags truststore` makes it the legacy
+admin CA alone (byte-identical to `ansible/tls/ca/ca.crt`, sha256 pinned).
+`truststore_kafka.pem` (9092) is untouched and keeps the shared root. Lab evidence:
+[docs/ADMIN-API-HARDENING-LAB.md](docs/ADMIN-API-HARDENING-LAB.md).
+
+### Minimal path: remove the shared root
+
+Needs only root SSH and the node certificates: no admin password, no rpk profile, and it
+works with `admin_api_require_auth=false`. Run from the main checkout (it holds
+`ansible/tls/ca`). `scripts/redpanda-admin/run-with-pinned-host-keys.sh` wraps
+`ansible-playbook` with strict host-key checking against `~/.ssh/known_hosts` (it prints
+found/missing per broker and refuses if one is missing), its own SSH control sockets and
+`-i artifacts/hosts.ini --private-key ~/.ssh/id_rsa`.
+
+```shell
+R=scripts/redpanda-admin/run-with-pinned-host-keys.sh
+P=ansible/harden-admin-auth.yml
+$R $P --tags preflight                        # read-only
+$R $P --check --tags truststore,verify_trust  # dry run, changes nothing
+$R $P --tags truststore                       # one broker at a time
+$R $P --tags verify_trust
+```
+
+- **preflight** reports per broker `truststore.pem=overlap (legacy admin CA + shared root)`,
+  current peers on 9644/8081/8082, source IPs of recent Kafka connections as `admin`, and
+  non-zero schema registry / proxy operations. It warns (does not stop) when a listener's
+  loaded trust differs from the file; `--tags truststore` converges that.
+- **truststore**, per broker: healthy cluster, backup to
+  `/var/backups/redpanda-admin-hardening/truststore.pem.<overlap-sha256>`, re-check of the
+  source sha256, install (regular file, mode 0644), then the loaded CRC32C of the admin, rpc,
+  schema_registry and rest_proxy listeners on every shard. Expect `reloaded live`. When a
+  listener keeps the old trust for 30 s (seen in the lab on a later replacement, and likely on
+  brokers not restarted since the 2026-10-29 overlap roll), the broker gets a guarded restart:
+  confirmation, no pre-restart risks, drain into maintenance, restart, ready and alive, end
+  maintenance, full replication (a failure ends maintenance automatically). Then 30 s
+  observation and a verify. Expect `loaded by a guarded broker restart` in that case.
+- **Restart confirmation**: on a terminal, type `restart` at the prompt. Without a terminal,
+  pass `-e harden_confirm_restart=<inventory_hostname>`; it confirms exactly that broker. Any
+  other broker that needs a restart stops the run before its drain (its new file stays in
+  place): rerun with that broker's name, the step continues where it stopped.
+  `-e harden_truststore_restart=always` also restarts brokers whose file this run changed;
+  it only acts in the run that writes the file, so a rerun after a stop does not restart
+  again. Use the default (auto) when running without a terminal.
+- **verify_trust**: legacy-only `truststore.pem` loaded by every listener and shard, node
+  certificate verifies, `truststore_kafka.pem` unchanged, healthy cluster.
+
+After the change, shared-root clients are refused on 9644, 8081 and 8082 (TLS `unknown ca`);
+legacy-admin-CA clients and internode RPC keep working, and 9092 still accepts shared-root
+leaves + SCRAM. Guards: real runs need explicit `--tags`; forward steps refuse `--limit`
+(rollbacks allow it) and `--skip-tags preflight`.
+
+**Rollback**: `$R $P --tags rollback_truststore` restores the backup (sha256 pinned), with the
+same reload check and confirmed restart. **Killed run left a broker in maintenance**: as
+root on a broker, `rpk cluster maintenance status`, then `rpk cluster maintenance disable <node_id>`.
+**Listener stuck by hand**: the same sequence on that broker, `rpk cluster maintenance enable
+<id> --wait`, `systemctl restart redpanda`, wait for `/v1/status/ready`, `rpk cluster
+maintenance disable <id>`, wait for a healthy, fully replicated cluster.
+
+### Optional hardening (recommended, independent)
+
+Recommended because the `admin` SASL password and the Prometheus scrape key were exposed on
+2026-11-06, and because with `admin_api_require_auth=false` any certificate that
+`truststore.pem` accepts can act as superuser on 9644 (the legacy-admin-CA leaves remain, e.g.
+`prom.crt`). Nothing in the minimal path depends on these steps, in any order.
+
+```shell
+scripts/redpanda-admin/generate-admin-password.sh   # secrets/redpanda-admin-password, 0600, never printed
+$R $P --tags password       # rotate admin (node cert, auth off) + root rpk profile /root/.config/rpk/rpk.yaml (0600)
+$R $P --tags require_auth   # admin_api_require_auth=true, live; refuses unless the file and rpk login work
+$R $P --tags verify_auth    # node cert alone: 403 on users/cluster_config/node_config; 200 on ready and metrics
+scripts/redpanda-admin/issue-prometheus-scraper-cert.sh   # new EC P-256 scrape cert, prints the kubectl step
+```
+
+- After `password`, remove the plaintext copy from `/root/.bash_history` on 195.201.60.99 and
+  use `REDPANDA_ADMIN_PASSWORD_FILE=secrets/redpanda-admin-password` for
+  `scripts/kafka-client/grant-prefix-access.sh`. Kafka clients logged in as `admin` (see the
+  preflight) break at the rotation.
+- After `require_auth`, privileged 9644 calls need the admin login as basic auth: rpk as root
+  (profile) and `upgrade-cluster.yml` (sends it when the password file exists) keep working;
+  a script that POSTs `/v1/security/users` with the node certificate alone (such as
+  `create-scram-user.sh`) gets 403. `/public_metrics` and `/metrics` stay open, so the
+  Prometheus scrape needs no basic auth. Once auth is on, the minimal path needs the password
+  file too (preflight and the restart path read `/v1/node_config` and `/v1/brokers`).
+- The scraper script prints a type check of the existing Secret and
+  `kubectl --context talos-eu -n prometheus create secret generic redpanda-admin-metrics-client ... --dry-run=client -o yaml | kubectl ... replace -f -`
+  (`replace` drops the last-applied annotation that would hold the key). The old key cannot be
+  revoked; `require_auth` limits it to the read-only unauthenticated endpoints.
+- Rollback: `$R $P --tags rollback_require_auth` (needs the admin login). No return to the
+  exposed password.
+- **Admin login lost**: copy it back from a broker profile without printing it,
+  `(umask 077; ssh root@195.201.61.227 "sed -n 's/^ *password: //p' /root/.config/rpk/rpk.yaml" > secrets/redpanda-admin-password)`.
+  With every copy lost while `admin_api_require_auth=true`, no tested path exists.
+- `--tags verify` runs `verify_trust` and `verify_auth`. An untagged `--check` covers the
+  optional steps too and needs the password file.
+
+### Schema registry and REST proxy (separate, later)
+
+Not part of any run. After the truststore step 8081/8082 accept any legacy-admin-CA
+certificate, and with `authentication_method` unset and
+`schema_registry_enable_authorization=false` such a client can write schemas. The later step
+is `authentication_method: http_basic` on the `schema_registry_api` (and `pandaproxy_api`)
+listeners (node config, rolling restart) plus `schema_registry_enable_authorization: true`,
+with a SCRAM user and schema registry ACLs per client. Collect the preflight's peer and
+operation report first and agree the users with those clients.
+
 ## Update (day)
 
 For an existing TLS cluster, run the rolling patch upgrade playbook:

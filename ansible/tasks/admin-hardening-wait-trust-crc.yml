@@ -1,0 +1,40 @@
+---
+# Waits until every admin-trust listener on every shard reports harden_expected_crc32c in
+# vectorized_tls_trust_file_crc32c, and every kafka series still reports truststore_kafka.pem.
+# Sets harden_trust_converged. Fails unless harden_trust_wait_strict is false.
+- name: Wait for every admin-trust listener to load the expected trust file
+  ansible.builtin.uri:
+    url: "{{ harden_admin_url }}/metrics"
+  register: harden_loaded_metrics
+  check_mode: false
+  vars:
+    harden_series: "{{ harden_loaded_metrics.content | default('') | regex_findall(harden_trust_series_regex) }}"
+    harden_admin_series: "{{ harden_series | selectattr(0, 'in', harden_admin_trust_areas) | list }}"
+  until: >-
+    harden_admin_series | map(attribute=0) | unique | sort == harden_admin_trust_areas | sort
+    and harden_admin_series | map(attribute=2) | unique | list == [harden_expected_crc32c | string]
+  retries: "{{ harden_trust_wait_retries | default(15) }}"
+  delay: 2
+  failed_when: false
+  # ansible-core < 2.19 marks exhausted retries failed despite failed_when; the assert below decides.
+  ignore_errors: true
+
+- name: Keep the loaded trust per listener and shard
+  ansible.builtin.set_fact:
+    harden_trust_series: "{{ harden_loaded_metrics.content | default('') | regex_findall(harden_trust_series_regex) }}"
+
+- name: Decide whether every listener runs with the expected trust
+  ansible.builtin.set_fact:
+    harden_trust_converged: >-
+      {{ harden_trust_series | selectattr(0, 'in', harden_admin_trust_areas) | map(attribute=0) | unique | sort == harden_admin_trust_areas | sort
+         and harden_trust_series | selectattr(0, 'in', harden_admin_trust_areas) | map(attribute=2) | unique | list == [harden_expected_crc32c | string]
+         and harden_trust_series | selectattr(0, 'equalto', 'kafka') | map(attribute=2) | unique | list == [harden_kafka_trust.crc32c | string] }}
+
+- name: Require every listener to run with the expected trust files
+  ansible.builtin.assert:
+    that:
+      - harden_trust_converged | bool
+    fail_msg: >-
+      Loaded trust [area, shard, crc32c]: {{ harden_trust_series }}; expected {{ harden_expected_crc32c }}
+      for {{ harden_admin_trust_areas }} and {{ harden_kafka_trust.crc32c }} for kafka.
+  when: harden_trust_wait_strict | default(true) | bool

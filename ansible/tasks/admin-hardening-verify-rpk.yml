@@ -1,0 +1,31 @@
+---
+# Proves root's rpk profile works for both APIs: Kafka over SASL and the admin API
+# with basic auth (rpk sends the profile's SASL user and password to 9644).
+- name: Check the Kafka API with the rpk profile (SASL SCRAM)
+  ansible.builtin.command:
+    argv: [rpk, cluster, info, --print-brokers]
+  register: harden_rpk_kafka
+  changed_when: false
+  check_mode: false
+
+- name: Check the admin API with the rpk profile
+  ansible.builtin.command:
+    argv: [rpk, security, user, list]
+  register: harden_rpk_users
+  changed_when: false
+  check_mode: false
+  failed_when: harden_rpk_users.rc != 0 or redpanda_admin_user not in harden_rpk_users.stdout_lines[1:]
+
+- name: Check cluster health through rpk
+  ansible.builtin.command:
+    argv: [rpk, cluster, health]
+  register: harden_rpk_health
+  changed_when: false
+  check_mode: false
+  failed_when: harden_rpk_health.rc != 0 or harden_rpk_health.stdout is not search('(?m)^Healthy:\s+true$')
+
+- name: Check ACL listing through rpk
+  ansible.builtin.command:
+    argv: [rpk, security, acl, list]
+  changed_when: false
+  check_mode: false

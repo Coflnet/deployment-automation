@@ -1,0 +1,708 @@
+---
+# Removes the shared root from truststore.pem on the shared 3-broker cluster; optional
+# admin-login hardening is kept separate. README.md "Admin API hardening" has the commands.
+#
+# Minimal path (node certificates only; works with admin_api_require_auth=false, no password):
+#   --tags preflight      read-only checks and a client-usage report (also runs before every step)
+#   --tags truststore     legacy admin CA only in truststore.pem, one broker at a time
+#   --tags verify_trust   trust end state
+#   --tags rollback_truststore   explicit rollback (never runs otherwise)
+# Optional, independent (secrets/redpanda-admin-password from generate-admin-password.sh):
+#   --tags password       rotate the admin SASL password, root's rpk login on every broker
+#   --tags require_auth   admin_api_require_auth=true (live)
+#   --tags verify_auth    login and lock end state (--tags verify runs both verifies)
+#   --tags rollback_require_auth
+#
+# truststore.pem is reloaded live; when a listener keeps the old trust (seen in the lab on a
+# later replacement) or -e harden_truststore_restart=always, the broker gets a guarded restart
+# through maintenance mode, confirmed on the terminal or by -e harden_confirm_restart=<broker>.
+# Real runs need explicit step tags; forward steps refuse --limit and --skip-tags preflight.
+- name: Check every broker before admin API hardening
+  hosts: redpanda
+  tags: [preflight, password, require_auth, truststore, verify, verify_trust, verify_auth]
+  become: true
+  any_errors_fatal: true
+  vars_files: &harden_vars
+    - vars/redpanda-admin-api.yml
+    - vars/redpanda-admin-hardening.yml
+  module_defaults: &harden_admin_api
+    ansible.builtin.uri:
+      ca_path: /etc/redpanda/certs/truststore.pem
+      client_cert: /etc/redpanda/certs/node.crt
+      client_key: /etc/redpanda/certs/node.key
+      return_content: true
+      url_username: "{{ redpanda_admin_user if redpanda_admin_basic_auth else omit }}"
+      url_password: "{{ lookup('ansible.builtin.file', redpanda_admin_password_path) if redpanda_admin_basic_auth else omit }}"
+      force_basic_auth: "{{ redpanda_admin_basic_auth }}"
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Require explicit step tags for a real run
+      ansible.builtin.assert:
+        that:
+          - ansible_check_mode or 'all' not in ansible_run_tags
+        fail_msg: Run one step at a time with --tags (README, Admin API hardening); untagged runs need --check.
+      run_once: true
+
+    # Only the optional password/require_auth steps need the password file and the admin user;
+    # the truststore path works with the node certificate while admin_api_require_auth=false.
+    - name: Note whether optional admin-login steps are selected
+      ansible.builtin.set_fact:
+        harden_auth_steps: "{{ ansible_run_tags | intersect(['all', 'password', 'require_auth', 'verify', 'verify_auth']) | length > 0 }}"
+
+    - name: Read the controller-side password file metadata
+      ansible.builtin.stat:
+        path: "{{ redpanda_admin_password_path }}"
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: harden_password_stat
+      when: harden_auth_steps | bool
+
+    - name: Require a private generated password file on the controller
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - harden_password_stat.stat.isreg | default(false)
+          - harden_password_stat.stat.mode == '0600'
+          - lookup('ansible.builtin.file', redpanda_admin_password_path) is match('^[A-Za-z0-9]{32,128}$')
+        fail_msg: >-
+          {{ redpanda_admin_password_path }} must exist, be mode 0600 and hold one line of 32-128
+          letters and digits. Run scripts/redpanda-admin/generate-admin-password.sh first.
+      run_once: true
+      when: harden_auth_steps | bool
+
+    - name: Read the legacy admin CA that becomes truststore.pem
+      ansible.builtin.command:
+        argv: [python3, "{{ playbook_dir }}/files/redpanda-trust-report.py", "{{ harden_legacy_ca_file }}"]
+      delegate_to: localhost
+      become: false
+      run_once: true
+      register: harden_legacy_ca_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Keep the legacy admin CA facts
+      ansible.builtin.set_fact:
+        harden_legacy_ca: "{{ (harden_legacy_ca_raw.stdout | from_json)[harden_legacy_ca_file] }}"
+
+    - name: Require exactly the pinned legacy admin CA
+      ansible.builtin.assert:
+        that:
+          - harden_legacy_ca.sha256 == harden_legacy_ca_sha256
+          - harden_legacy_ca.certificates == [harden_legacy_ca_fingerprint]
+
+    - name: Read broker identity
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/node_config"
+      register: harden_node_config
+      check_mode: false
+
+    - name: Read current broker membership
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/brokers"
+      register: harden_brokers
+      check_mode: false
+
+    - name: Require active brokers outside maintenance
+      ansible.builtin.assert:
+        that:
+          - harden_brokers.json | length == groups['redpanda'] | length
+          - harden_brokers.json | selectattr('is_alive', 'equalto', true) | list | length == harden_brokers.json | length
+          - harden_brokers.json | selectattr('membership_status', 'equalto', 'active') | list | length == harden_brokers.json | length
+          - harden_brokers.json | selectattr('maintenance_status.draining', 'equalto', true) | list | length == 0
+
+    - name: Require a healthy cluster
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Read the cluster configuration
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/cluster_config?include_defaults=true"
+      register: harden_cluster_config
+      check_mode: false
+
+    - name: Keep the current admin authentication mode
+      ansible.builtin.set_fact:
+        harden_admin_require_auth: "{{ harden_cluster_config.json.admin_api_require_auth | bool }}"
+
+    - name: Require SASL with the admin superuser
+      ansible.builtin.assert:
+        that:
+          - harden_cluster_config.json.enable_sasl | bool
+          - "'SCRAM' in harden_cluster_config.json.sasl_mechanisms"
+          - redpanda_admin_user in harden_cluster_config.json.superusers
+          - harden_cluster_config.json.kafka_enable_authorization in [none, true]
+      when: harden_auth_steps | bool
+
+    - name: Read SASL users
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/security/users"
+      register: harden_users
+      check_mode: false
+      failed_when: harden_users.status != 200 or redpanda_admin_user not in harden_users.json
+      when: harden_auth_steps | bool
+
+    - name: Report both trust files
+      ansible.builtin.include_tasks: tasks/admin-hardening-trust-report.yml
+
+    - name: Preserve the Kafka trust file checksum for later comparison
+      ansible.builtin.set_fact:
+        harden_kafka_trust_before: "{{ harden_kafka_trust }}"
+
+    - name: Require a known admin trust state and an untouched Kafka trust
+      ansible.builtin.assert:
+        that:
+          - harden_admin_trust.sha256 in [harden_overlap_truststore_sha256, harden_legacy_ca_sha256]
+          - harden_legacy_ca_fingerprint in harden_admin_trust.certificates
+          - harden_shared_root_fingerprint in harden_kafka_trust.certificates
+
+    # sslserver: HTTPS and RPC server side; sslclient: internode RPC client side.
+    - name: Require this broker's node certificate to verify against the legacy admin CA alone
+      ansible.builtin.command:
+        argv: [openssl, verify, -x509_strict, -purpose, "{{ item }}", -CAfile, /dev/stdin, "{{ harden_certs_dir }}/node.crt"]
+        stdin: "{{ lookup('ansible.builtin.file', harden_legacy_ca_file) }}"
+      loop: [sslserver, sslclient]
+      changed_when: false
+      check_mode: false
+
+    - name: Compare the loaded trust with the files on disk
+      ansible.builtin.include_tasks: tasks/admin-hardening-wait-trust-crc.yml
+      vars:
+        harden_expected_crc32c: "{{ harden_admin_trust.crc32c }}"
+        harden_trust_wait_strict: false
+        harden_trust_wait_retries: 3
+
+    # A mismatch (an interrupted truststore run, or a listener that never loaded an earlier
+    # replacement) does not block any step: the truststore step converges it, with a
+    # confirmed restart if needed, and verify is strict.
+    - name: Warn when the loaded trust differs from the files on disk
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: loaded trust [area, shard, crc32c] {{ harden_trust_series }} differs from truststore.pem
+          ({{ harden_admin_trust.crc32c }}) or truststore_kafka.pem ({{ harden_kafka_trust.crc32c }}).
+          --tags truststore (or rollback_truststore) converges it.
+      when: not harden_trust_converged | bool
+
+    - name: Read the rpk section of the node configuration
+      ansible.builtin.slurp:
+        src: /etc/redpanda/redpanda.yaml
+      register: harden_redpanda_yaml
+      no_log: true
+
+    - name: Keep the broker's rpk connection settings
+      ansible.builtin.set_fact:
+        harden_rpk_node: "{{ (harden_redpanda_yaml.content | b64decode | from_yaml).rpk | default({}) }}"
+      no_log: true
+
+    - name: Require complete rpk TLS settings to copy into the profile
+      ansible.builtin.assert:
+        that:
+          - harden_rpk_node.kafka_api.brokers | length > 0
+          - harden_rpk_node.admin_api.addresses | length > 0
+          - harden_rpk_node.kafka_api.tls.cert_file is defined
+          - harden_rpk_node.kafka_api.tls.key_file is defined
+          - harden_rpk_node.kafka_api.tls.truststore_file is defined
+          - harden_rpk_node.admin_api.tls.cert_file is defined
+          - harden_rpk_node.admin_api.tls.key_file is defined
+          - harden_rpk_node.admin_api.tls.truststore_file is defined
+      when: harden_auth_steps | bool
+
+    - name: Look for an existing rpk profile file
+      ansible.builtin.stat:
+        path: "{{ harden_rpk_profile_file }}"
+      register: harden_rpk_profile_stat
+
+    - name: Read the existing rpk profile file
+      ansible.builtin.slurp:
+        src: "{{ harden_rpk_profile_file }}"
+      register: harden_rpk_profile_raw
+      when: harden_rpk_profile_stat.stat.exists
+      no_log: true
+
+    - name: Keep the existing rpk profile document
+      ansible.builtin.set_fact:
+        harden_rpk_profile_existing: "{{ harden_rpk_profile_raw.content | b64decode | from_yaml if harden_rpk_profile_stat.stat.exists else {} }}"
+      no_log: true
+
+    - name: Refuse an rpk profile file this playbook did not write
+      ansible.builtin.assert:
+        quiet: true
+        that:
+          - harden_rpk_profile_existing.profiles | default([]) | map(attribute='name') | difference([harden_rpk_profile_name]) | length == 0
+        fail_msg: "{{ harden_rpk_profile_file }} holds other rpk profiles; inspect it by hand before rerunning."
+      when: harden_auth_steps | bool
+
+    - name: Read established clients of the admin API, schema registry and REST proxy
+      ansible.builtin.command:
+        argv: [ss, -Htn, state, established, "( sport = :{{ item }} )"]
+      loop: [9644, 8081, 8082]
+      register: harden_http_clients
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Read recent Kafka connections of the admin login (cluster-wide)
+      ansible.builtin.command:
+        argv: [rpk, cluster, connections, list, --format, json, --limit, "1000"]
+      register: harden_kafka_connections
+      run_once: true
+      changed_when: false
+      failed_when: false
+      check_mode: false
+
+    - name: Read schema registry and REST proxy request counters since the broker started
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/metrics"
+      register: harden_internal_metrics
+      check_mode: false
+
+    - name: Record the broker process
+      ansible.builtin.command:
+        argv: "{{ harden_pid_argv }}"
+      register: harden_pid_preflight
+      changed_when: false
+      check_mode: false
+
+    - name: Summarise current peers per port
+      ansible.builtin.set_fact:
+        harden_peers: >-
+          {{ harden_peers | default({}) | combine({item.item: item.stdout_lines | map('split') | map('last')
+             | map('regex_replace', ':[0-9]+$', '') | unique | list}) }}
+      loop: "{{ harden_http_clients.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+      when: item.rc == 0
+
+    - name: Summarise source addresses of Kafka connections as the admin login
+      ansible.builtin.set_fact:
+        harden_admin_connections: >-
+          {{ ((harden_kafka_connections.stdout | from_json).connections | default([]) if harden_kafka_connections.rc == 0 else [])
+             | selectattr('authentication_info.user_principal', 'defined')
+             | selectattr('authentication_info.user_principal', 'equalto', redpanda_admin_user)
+             | map(attribute='source.ip_address') | unique | list }}
+        harden_connection_count: >-
+          {{ ((harden_kafka_connections.stdout | from_json).connections | default([]) if harden_kafka_connections.rc == 0 else []) | length }}
+
+    - name: Report the starting state
+      ansible.builtin.debug:
+        msg:
+          - "node_id={{ harden_node_config.json.node_id }} pid={{ harden_pid_preflight.stdout }}"
+          - "admin_api_require_auth={{ harden_admin_require_auth }} schema_registry_enable_authorization={{ harden_cluster_config.json.schema_registry_enable_authorization }}"
+          - "truststore.pem={{ 'overlap (legacy admin CA + shared root)' if harden_admin_trust.sha256 == harden_overlap_truststore_sha256 else 'legacy admin CA only' }}"
+          - "rpk profile {{ harden_rpk_profile_file }}: {{ 'present' if harden_rpk_profile_stat.stat.exists else 'absent' }}"
+          - "peers now per port (9644 admin, 8081 schema registry, 8082 proxy): {{ harden_peers | default('ss unavailable') }}"
+          - >-
+            recent Kafka connections as {{ redpanda_admin_user }} from: {{ harden_admin_connections if harden_kafka_connections.rc == 0
+            else 'unavailable (rpk cluster connections list failed)' }} (of {{ harden_connection_count }} parsed; broker IPs are
+            this playbook's own probes)
+          - "trust areas not checked by this playbook: {{ harden_trust_series | map(attribute=0) | unique | difference(harden_admin_trust_areas + ['kafka']) | list }}"
+          - "8081/8082 non-zero operations since start: {{ harden_internal_metrics.content | regex_findall('(?m)^vectorized_pandaproxy_request_latency_count\\{operation=\"([a-z_]+)\",shard=\"[0-9]+\"\\} [1-9][0-9]*') | unique | list }}"
+
+- name: Rotate the admin SASL password and give root's rpk a login
+  hosts: redpanda
+  tags: password
+  become: true
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Check whether the password file already authenticates over SASL
+      ansible.builtin.include_tasks: tasks/admin-hardening-scram-probe.yml
+
+    - name: Decide whether the password must be rotated
+      ansible.builtin.set_fact:
+        harden_rotation_needed: >-
+          {{ ansible_play_hosts | map('extract', hostvars, 'harden_scram_ok') | reject('equalto', true) | list | length > 0 }}
+
+    - name: Report the rotation decision
+      ansible.builtin.debug:
+        msg: "{{ 'rotating the admin password (the file does not authenticate yet)' if harden_rotation_needed else 'the file already authenticates; no rotation' }}"
+      run_once: true
+
+    - name: Require the admin API to accept the node certificate for the rotation
+      ansible.builtin.assert:
+        that:
+          - not harden_admin_require_auth
+        fail_msg: >-
+          The password file does not authenticate and admin_api_require_auth is already true.
+          See README, Admin API hardening, "Recovery: the admin login does not work".
+      when: harden_rotation_needed
+
+    - name: Rotate the admin password through the controller with the node certificate
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/security/users/{{ redpanda_admin_user }}"
+        method: PUT
+        body_format: json
+        body:
+          username: "{{ redpanda_admin_user }}"
+          password: "{{ lookup('ansible.builtin.file', redpanda_admin_password_path) }}"
+          algorithm: "{{ harden_sasl_mechanism }}"
+        url_username: "{{ omit }}"
+        url_password: "{{ omit }}"
+        force_basic_auth: false
+        follow_redirects: all
+      run_once: true
+      when: harden_rotation_needed
+      changed_when: true
+      no_log: true
+
+    - name: Wait until every broker accepts the new password over SASL
+      ansible.builtin.include_tasks: tasks/admin-hardening-scram-probe.yml
+      vars:
+        harden_scram_wait: true
+      when: harden_rotation_needed and not ansible_check_mode
+
+    - name: Require the new password on every broker
+      ansible.builtin.assert:
+        that:
+          - harden_scram_ok | bool
+        fail_msg: The rotated password is not accepted over SASL on this broker.
+      when: harden_rotation_needed and not ansible_check_mode
+
+    - name: Build root's rpk profile from the broker's rpk settings
+      ansible.builtin.set_fact:
+        harden_rpk_profile:
+          name: "{{ harden_rpk_profile_name }}"
+          description: Root-only admin login for rpk and Ansible (ansible/harden-admin-auth.yml)
+          kafka_api:
+            brokers: "{{ harden_rpk_node.kafka_api.brokers }}"
+            tls:
+              key_file: "{{ harden_rpk_node.kafka_api.tls.key_file }}"
+              cert_file: "{{ harden_rpk_node.kafka_api.tls.cert_file }}"
+              ca_file: "{{ harden_rpk_node.kafka_api.tls.truststore_file }}"
+            sasl:
+              user: "{{ redpanda_admin_user }}"
+              password: "{{ lookup('ansible.builtin.file', redpanda_admin_password_path) }}"
+              mechanism: "{{ harden_sasl_mechanism }}"
+          admin_api:
+            addresses: "{{ harden_rpk_node.admin_api.addresses }}"
+            tls:
+              key_file: "{{ harden_rpk_node.admin_api.tls.key_file }}"
+              cert_file: "{{ harden_rpk_node.admin_api.tls.cert_file }}"
+              ca_file: "{{ harden_rpk_node.admin_api.tls.truststore_file }}"
+      no_log: true
+
+    - name: Compare with the profile already on the broker
+      ansible.builtin.set_fact:
+        harden_rpk_profile_current: >-
+          {{ harden_rpk_profile_existing.current_profile | default('') == harden_rpk_profile_name
+             and harden_rpk_profile_existing.profiles | default([]) | length == 1
+             and harden_rpk_profile_existing.profiles[0].kafka_api | default({}) == harden_rpk_profile.kafka_api
+             and harden_rpk_profile_existing.profiles[0].admin_api | default({}) == harden_rpk_profile.admin_api }}
+      no_log: true
+
+    - name: Create root's private rpk directory
+      ansible.builtin.file:
+        path: "{{ harden_rpk_profile_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Install root's rpk profile with the admin login
+      ansible.builtin.copy:
+        content: "{{ {'version': 7, 'current_profile': harden_rpk_profile_name, 'profiles': [harden_rpk_profile]} | to_nice_yaml(indent=2) }}"
+        dest: "{{ harden_rpk_profile_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      diff: false
+      no_log: true
+      when: not harden_rpk_profile_current
+
+    - name: Keep the profile file private
+      ansible.builtin.file:
+        path: "{{ harden_rpk_profile_file }}"
+        owner: root
+        group: root
+        mode: "0600"
+      when: not ansible_check_mode
+
+    - name: Verify rpk with the new login
+      ansible.builtin.include_tasks: tasks/admin-hardening-verify-rpk.yml
+      when: not ansible_check_mode
+
+- name: Require authentication on the admin API
+  hosts: redpanda
+  tags: require_auth
+  become: true
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Require the controller to send basic auth from now on
+      ansible.builtin.assert:
+        that:
+          - redpanda_admin_basic_auth | bool
+
+    - name: Require root's rpk login on every broker before locking the API
+      ansible.builtin.include_tasks: tasks/admin-hardening-verify-rpk.yml
+      when: not ansible_check_mode
+
+    # Basic auth is ignored while auth is off, so only SASL proves the file Ansible will use.
+    - name: Try the controller's password file over SASL
+      ansible.builtin.include_tasks: tasks/admin-hardening-scram-probe.yml
+
+    - name: Require the controller's password file to be the admin login before locking the API
+      ansible.builtin.assert:
+        that:
+          - harden_scram_ok | bool
+        fail_msg: >-
+          {{ redpanda_admin_password_path }} does not authenticate as {{ redpanda_admin_user }}; locking the
+          API now would lock Ansible out. Run --tags password first.
+      when: not ansible_check_mode
+
+    - name: Enable admin_api_require_auth cluster-wide
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/cluster_config"
+        method: PUT
+        body_format: json
+        body:
+          upsert:
+            admin_api_require_auth: true
+          remove: []
+        follow_redirects: all
+      run_once: true
+      register: harden_require_auth_change
+      changed_when: true
+      when: not harden_admin_require_auth
+
+    - name: Wait until every broker applied the configuration without a restart
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/cluster_config/status"
+      register: harden_config_status
+      vars:
+        harden_target_version: "{{ harden_require_auth_change.json.config_version | default(0) }}"
+      until: >-
+        harden_config_status.status | default(0) == 200
+        and harden_config_status.json | length == groups['redpanda'] | length
+        and harden_config_status.json | map(attribute='config_version') | min >= harden_target_version | int
+        and harden_config_status.json | selectattr('restart', 'equalto', true) | list | length == 0
+        and harden_config_status.json | map(attribute='invalid') | flatten | length == 0
+        and harden_config_status.json | map(attribute='unknown') | flatten | length == 0
+      retries: 20
+      delay: 3
+      check_mode: false
+      when: not ansible_check_mode
+
+    - name: Verify the locked admin API on this broker
+      ansible.builtin.include_tasks: tasks/admin-hardening-verify-locked.yml
+      when: not ansible_check_mode
+
+- name: Remove the shared root from the admin truststore, one broker at a time
+  hosts: redpanda
+  tags: truststore
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Require the preflight's pinned CA facts (it must not be skipped)
+      ansible.builtin.assert:
+        that:
+          - harden_legacy_ca is defined
+          - harden_legacy_ca.sha256 == harden_legacy_ca_sha256
+          - harden_kafka_trust_before is defined
+        fail_msg: The preflight did not run in this invocation; do not use --skip-tags preflight.
+
+    - name: Require a healthy cluster before changing this broker
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Report both trust files
+      ansible.builtin.include_tasks: tasks/admin-hardening-trust-report.yml
+
+    - name: Replace the overlap truststore with the legacy admin CA
+      when: harden_admin_trust.sha256 != harden_legacy_ca_sha256
+      block:
+        - name: Require the pinned overlap truststore
+          ansible.builtin.assert:
+            that:
+              - harden_admin_trust.sha256 == harden_overlap_truststore_sha256
+
+        - name: Create a protected backup directory
+          ansible.builtin.file:
+            path: "{{ harden_backup_dir }}"
+            state: directory
+            owner: root
+            group: root
+            mode: "0700"
+
+        - name: Back up the overlap truststore without overwriting an earlier backup
+          ansible.builtin.copy:
+            src: "{{ harden_truststore }}"
+            dest: "{{ harden_truststore_backup }}"
+            remote_src: true
+            force: false
+            owner: root
+            group: root
+            mode: "0600"
+          when: not ansible_check_mode
+
+        - name: Verify the backup
+          ansible.builtin.stat:
+            path: "{{ harden_truststore_backup }}"
+            checksum_algorithm: sha256
+          register: harden_backup_stat
+          failed_when: not ansible_check_mode and harden_backup_stat.stat.checksum | default('') != harden_overlap_truststore_sha256
+
+    # Also runs when the file is already legacy-only: a listener that never loaded it
+    # (an interrupted earlier run) is found by its CRC32C metric and restarted.
+    - name: Install the legacy admin CA as the whole truststore
+      ansible.builtin.include_tasks: tasks/admin-hardening-install-truststore.yml
+      vars:
+        harden_install_src: "{{ harden_legacy_ca_file }}"
+        harden_install_sha256: "{{ harden_legacy_ca_sha256 }}"
+        harden_install_expected_crc32c: "{{ harden_legacy_ca.crc32c }}"
+
+    - name: Observe this broker before proceeding
+      ansible.builtin.pause:
+        seconds: 30
+      when: not ansible_check_mode and (harden_install_copy.changed or harden_restart_needed | bool)
+
+    - name: Verify this broker's trust files after the change
+      ansible.builtin.include_tasks: tasks/admin-hardening-verify-trust.yml
+      when: not ansible_check_mode
+
+- name: Verify the trust state
+  hosts: redpanda
+  tags: [verify, verify_trust]
+  become: true
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Verify both trust files (skipped in check mode, which changes nothing to verify)
+      ansible.builtin.include_tasks: tasks/admin-hardening-verify-trust.yml
+      when: not ansible_check_mode
+
+    - name: Report the trust state
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: truststore.pem = legacy admin CA only on every listener and shard,
+          truststore_kafka.pem unchanged.
+      when: not ansible_check_mode
+
+- name: Verify the optional admin login and lock
+  hosts: redpanda
+  tags: [verify, verify_auth]
+  become: true
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Refuse a run limited to part of the cluster
+      ansible.builtin.include_tasks: tasks/admin-hardening-require-full-cluster.yml
+
+    - name: Verify the live end state (skipped in check mode, which changes nothing to verify)
+      when: not ansible_check_mode
+      block:
+        - name: Verify root's rpk login
+          ansible.builtin.include_tasks: tasks/admin-hardening-verify-rpk.yml
+
+        - name: Verify the locked admin API
+          ansible.builtin.include_tasks: tasks/admin-hardening-verify-locked.yml
+
+    - name: Report the admin login state
+      ansible.builtin.debug:
+        msg: >-
+          {{ inventory_hostname }}: admin_api_require_auth=true and root's rpk login OK;
+          /public_metrics and /metrics open to any trusted certificate.
+      when: not ansible_check_mode
+
+- name: "Rollback: restore the overlap truststore (legacy admin CA + shared root)"
+  hosts: redpanda
+  tags: [never, rollback_truststore]
+  become: true
+  serial: 1
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Read broker identity
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/node_config"
+      register: harden_node_config
+      check_mode: false
+
+    - name: Report both trust files
+      ansible.builtin.include_tasks: tasks/admin-hardening-trust-report.yml
+
+    - name: Read the backup taken before the change
+      ansible.builtin.script:
+        cmd: "files/redpanda-trust-report.py {{ harden_truststore_backup }}"
+        executable: python3
+      register: harden_backup_raw
+      changed_when: false
+      check_mode: false
+
+    - name: Require the pinned overlap truststore in the backup
+      ansible.builtin.assert:
+        that:
+          - (harden_backup_raw.stdout | from_json)[harden_truststore_backup].sha256 == harden_overlap_truststore_sha256
+
+    - name: Require a healthy cluster before changing this broker
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+    - name: Restore the overlap truststore
+      ansible.builtin.include_tasks: tasks/admin-hardening-install-truststore.yml
+      vars:
+        harden_install_src: "{{ harden_truststore_backup }}"
+        harden_install_sha256: "{{ harden_overlap_truststore_sha256 }}"
+        harden_install_remote_src: true
+        harden_install_expected_crc32c: "{{ (harden_backup_raw.stdout | from_json)[harden_truststore_backup].crc32c }}"
+
+    - name: Observe this broker before proceeding
+      ansible.builtin.pause:
+        seconds: 30
+      when: not ansible_check_mode and (harden_install_copy.changed or harden_restart_needed | bool)
+
+    - name: Require a healthy cluster after the restore
+      ansible.builtin.include_tasks: tasks/redpanda-health.yml
+
+- name: "Rollback: accept the node certificate alone on the admin API again"
+  hosts: redpanda
+  tags: [never, rollback_require_auth]
+  become: true
+  any_errors_fatal: true
+  vars_files: *harden_vars
+  module_defaults: *harden_admin_api
+  tasks:
+    - name: Disable admin_api_require_auth cluster-wide (needs the admin login)
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/cluster_config"
+        method: PUT
+        body_format: json
+        body:
+          upsert:
+            admin_api_require_auth: false
+          remove: []
+        follow_redirects: all
+      run_once: true
+      changed_when: true
+
+    - name: Wait until the node certificate alone may read users again
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/security/users"
+        url_username: "{{ omit }}"
+        url_password: "{{ omit }}"
+        force_basic_auth: false
+      register: harden_unlocked
+      until: harden_unlocked.status | default(0) == 200
+      retries: 20
+      delay: 3
+      check_mode: false
+      when: not ansible_check_mode

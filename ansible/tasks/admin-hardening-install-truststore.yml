@@ -1,0 +1,100 @@
+---
+# Installs truststore.pem from harden_install_src (controller file, or broker file with
+# harden_install_remote_src) and makes every admin-trust listener run with it.
+# Redpanda reloads trust files live, but the lab showed a later replacement can be
+# ignored by some listeners (docs/ADMIN-API-HARDENING-LAB.md); the per-listener CRC32C
+# metric detects that and this broker then gets a guarded, confirmed restart.
+# harden_install_sha256 pins the source bytes; they are re-checked right before the copy.
+- name: Read the current truststore ownership
+  ansible.builtin.stat:
+    path: "{{ harden_truststore }}"
+    follow: false
+  register: harden_truststore_stat
+
+- name: Require a regular truststore file, not a symlink
+  ansible.builtin.assert:
+    that:
+      - harden_truststore_stat.stat.isreg | default(false)
+      - not harden_truststore_stat.stat.islnk | default(true)
+    fail_msg: "{{ harden_truststore }} is missing or not a regular file; inspect it by hand."
+
+- name: Re-check the controller source file right before the copy
+  ansible.builtin.stat:
+    path: "{{ harden_install_src }}"
+    checksum_algorithm: sha256
+  delegate_to: localhost
+  become: false
+  register: harden_install_src_local
+  when: not harden_install_remote_src | default(false) | bool
+
+- name: Re-check the broker source file right before the copy
+  ansible.builtin.stat:
+    path: "{{ harden_install_src }}"
+    checksum_algorithm: sha256
+    follow: false
+  register: harden_install_src_remote
+  when: harden_install_remote_src | default(false) | bool
+
+- name: Require the pinned source bytes
+  ansible.builtin.assert:
+    that:
+      - harden_install_src_stat.stat.isreg | default(false)
+      - harden_install_src_stat.stat.checksum | default('') == harden_install_sha256
+  vars:
+    harden_install_src_stat: "{{ harden_install_src_remote if harden_install_remote_src | default(false) | bool else harden_install_src_local }}"
+    fail_msg: "{{ harden_install_src }} does not have the pinned sha256 {{ harden_install_sha256 }}."
+
+- name: Record the broker process before the change
+  ansible.builtin.command:
+    argv: "{{ harden_pid_argv }}"
+  register: harden_pid_before
+  changed_when: false
+  check_mode: false
+
+- name: Install the truststore
+  ansible.builtin.copy:
+    src: "{{ harden_install_src }}"
+    dest: "{{ harden_truststore }}"
+    remote_src: "{{ harden_install_remote_src | default(false) }}"
+    owner: "{{ harden_truststore_stat.stat.uid }}"
+    group: "{{ harden_truststore_stat.stat.gid }}"
+    mode: "0644"
+  register: harden_install_copy
+
+- name: Give every listener 30 seconds to reload the truststore live
+  ansible.builtin.include_tasks: admin-hardening-wait-trust-crc.yml
+  vars:
+    harden_expected_crc32c: "{{ harden_install_expected_crc32c }}"
+    harden_trust_wait_strict: false
+  when: not ansible_check_mode
+
+- name: Decide whether this broker needs a restart
+  ansible.builtin.set_fact:
+    harden_live_converged: "{{ ansible_check_mode or harden_trust_converged | bool }}"
+    harden_restart_needed: >-
+      {{ not ansible_check_mode and (not harden_trust_converged | bool
+         or (harden_truststore_restart == 'always' and harden_install_copy.changed)) }}
+
+- name: Restart this broker so every listener loads the truststore
+  ansible.builtin.include_tasks: admin-hardening-restart-broker.yml
+  when: harden_restart_needed | bool
+
+- name: Require every listener to run with the installed truststore
+  ansible.builtin.include_tasks: admin-hardening-wait-trust-crc.yml
+  vars:
+    harden_expected_crc32c: "{{ harden_install_expected_crc32c }}"
+  when: not ansible_check_mode
+
+- name: Record the broker process after the change
+  ansible.builtin.command:
+    argv: "{{ harden_pid_argv }}"
+  register: harden_pid_after
+  changed_when: false
+  check_mode: false
+
+- name: Report how the truststore was loaded
+  ansible.builtin.debug:
+    msg: >-
+      {{ 'loaded by a guarded broker restart' if harden_restart_needed | bool else 'reloaded live' }};
+      broker pid {{ harden_pid_before.stdout }} -> {{ harden_pid_after.stdout }}
+  when: not ansible_check_mode

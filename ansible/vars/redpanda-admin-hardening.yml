@@ -1,0 +1,44 @@
+---
+# Inputs of harden-admin-auth.yml. Every pin can be overridden from the inventory
+# (the lab does) through the variable named inside default(); nothing here is secret.
+
+# Public legacy admin CA (CN=Coflnet GmbH, O=Coflnet) that becomes the whole of
+# truststore.pem. It is the ca.crt next to the CA key in the main checkout.
+harden_legacy_ca_file: "{{ redpanda_legacy_admin_ca_file | default(playbook_dir ~ '/tls/ca/ca.crt') }}"
+# sha256 of that file's bytes; identical to the pre-overlap truststore.pem.
+harden_legacy_ca_sha256: "{{ redpanda_legacy_admin_ca_sha256 | default('7d2daeb8a6bebbb59abea8da36a3dbf443514b2a86a816bcbf9c9c0b9e9764a9') }}"
+# sha256 of today's truststore.pem: legacy admin CA + shared root (added by
+# dev/ansible databases/playbooks/02-roll-redpanda-shared-root-trust.yml).
+harden_overlap_truststore_sha256: "{{ redpanda_admin_overlap_truststore_sha256 | default('a74535a138ebbbe9e442560bd039fa4954c8e20c5f938907d288d175df4b4581') }}"
+# Certificate fingerprints (sha256 of DER).
+harden_legacy_ca_fingerprint: "{{ redpanda_legacy_admin_ca_fingerprint | default('70102e5ca9fb12a6008c673e9ff2ae211e3c995ecd90003c3b52672ca3ac1b72') }}"
+harden_shared_root_fingerprint: "{{ redpanda_shared_root_fingerprint | default('ebbb4ed36704f00d278e38f9d7b10daab9806c85c2abb007523aebac994e24f1') }}"
+
+harden_certs_dir: /etc/redpanda/certs
+harden_truststore: "{{ harden_certs_dir }}/truststore.pem"
+harden_kafka_truststore: "{{ harden_certs_dir }}/truststore_kafka.pem"
+# Listeners that load truststore.pem; kafka loads truststore_kafka.pem.
+harden_admin_trust_areas: [admin, rpc, rest_proxy, schema_registry]
+# Every vectorized_tls_trust_file_crc32c series as [area, shard, crc32c], any detail label.
+harden_trust_series_regex: '(?m)^vectorized_tls_trust_file_crc32c\{area="([a-z_]+)",detail="[^"]*",shard="([0-9]+)"\} ([0-9]+)\.0+$'
+# How the guarded fallback restarts a broker: systemd (production) or docker (lab).
+harden_restart_mode: "{{ redpanda_restart_mode | default('systemd') }}"
+# auto: restart a broker only when a listener keeps the old trust; always: also restart a
+# broker whose truststore.pem this run changed (-e harden_truststore_restart=always).
+harden_truststore_restart: auto
+# Confirms that restart without a terminal: -e harden_confirm_restart=<inventory_hostname>
+# names exactly the one broker allowed to restart. Empty: ask on the terminal (type "restart").
+harden_confirm_restart: ""
+harden_backup_dir: /var/backups/redpanda-admin-hardening
+harden_truststore_backup: "{{ harden_backup_dir }}/truststore.pem.{{ harden_overlap_truststore_sha256 }}"
+
+# Root-only rpk login. rpk reads ~/.config/rpk/rpk.yaml before redpanda.yaml.
+harden_rpk_profile_name: coflnet-admin
+harden_rpk_profile_dir: /root/.config/rpk
+harden_rpk_profile_file: "{{ harden_rpk_profile_dir }}/rpk.yaml"
+harden_sasl_mechanism: SCRAM-SHA-256
+
+# Reported before and after a truststore install. The lab overrides it (no systemd).
+harden_pid_argv: "{{ redpanda_pid_argv | default(['systemctl', 'show', 'redpanda', '--property=MainPID', '--value']) }}"
+
+harden_admin_url: "https://{{ inventory_hostname }}:9644"

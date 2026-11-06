@@ -1,0 +1,26 @@
+---
+# Tries the controller's password file as the admin login over Kafka SASL on this broker.
+# Sets harden_scram_ok. The password goes over stdin, never argv, and nothing is logged.
+# Basic auth cannot prove it while admin_api_require_auth is false (it is ignored then).
+- name: Try the password file as the admin login over SASL
+  ansible.builtin.command:
+    argv:
+      - sh
+      - -c
+      - IFS= read -r RPK_PASS && export RPK_PASS RPK_USER="$1" RPK_SASL_MECHANISM="$2" && exec rpk cluster info --print-brokers
+      - scram-probe
+      - "{{ redpanda_admin_user }}"
+      - "{{ harden_sasl_mechanism }}"
+    stdin: "{{ lookup('ansible.builtin.file', redpanda_admin_password_path) }}"
+  register: harden_scram_probe
+  until: harden_scram_probe.rc == 0 or not harden_scram_wait | default(false) | bool
+  retries: 20
+  delay: 3
+  changed_when: false
+  failed_when: false
+  check_mode: false
+  no_log: true
+
+- name: Keep the SASL probe result
+  ansible.builtin.set_fact:
+    harden_scram_ok: "{{ harden_scram_probe.rc == 0 }}"

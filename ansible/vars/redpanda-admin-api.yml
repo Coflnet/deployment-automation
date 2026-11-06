@@ -1,0 +1,10 @@
+---
+# Shared by every playbook that calls the Redpanda admin API on 9644.
+# Once admin_api_require_auth is true, privileged endpoints also need the admin
+# SASL user as HTTP basic auth. The password is read from the git-ignored file
+# written by scripts/redpanda-admin/generate-admin-password.sh, never from the
+# command line. Without the file, calls use the node certificate only, which
+# works only while admin_api_require_auth is false.
+redpanda_admin_user: admin
+redpanda_admin_password_path: "{{ redpanda_admin_password_file | default(playbook_dir ~ '/../secrets/redpanda-admin-password') }}"
+redpanda_admin_basic_auth: "{{ redpanda_admin_password_path is file }}"

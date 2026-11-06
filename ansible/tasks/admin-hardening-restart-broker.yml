@@ -1,0 +1,105 @@
+---
+# Guarded restart of this one broker, the same sequence as upgrade-cluster.yml:
+# no pre-restart risks, healthy cluster, drain into maintenance, restart, ready + alive,
+# leave maintenance, complete replication. Used when a listener did not reload the trust
+# file live (or harden_truststore_restart=always); confirmed first, on the terminal or by
+# -e harden_confirm_restart=<this broker>.
+- name: Ask on the terminal when no confirmation was passed
+  ansible.builtin.pause:
+    prompt: >-
+      {{ inventory_hostname }}: restart needed (mode {{ harden_truststore_restart }}); loaded trust
+      [area, shard, crc32c] {{ harden_trust_series | default([]) }}. Type "restart" to restart this broker
+      through maintenance mode; anything else stops the run (the new truststore file stays in place)
+  register: harden_restart_confirmation
+  when: harden_confirm_restart | length == 0
+
+# Without a terminal the prompt returns empty input, so only the extra var can confirm.
+- name: Require a confirmation for exactly this broker
+  ansible.builtin.assert:
+    that:
+      - >-
+        (harden_confirm_restart == inventory_hostname) if harden_confirm_restart | length > 0
+        else (harden_restart_confirmation.user_input | default('') | trim == 'restart')
+    fail_msg: >-
+      Restart of {{ inventory_hostname }} not confirmed (harden_confirm_restart='{{ harden_confirm_restart }}').
+      Rerun interactively, or with -e harden_confirm_restart={{ inventory_hostname }}.
+
+- name: Read pre-restart risks
+  ansible.builtin.uri:
+    url: "{{ harden_admin_url }}/v1/broker/pre_restart_probe"
+  register: harden_restart_probe
+  check_mode: false
+
+- name: Require no pre-restart risks
+  ansible.builtin.assert:
+    that:
+      - harden_restart_probe.json.risks.values() | map('length') | sum == 0
+
+- name: Require a healthy cluster before draining this broker
+  ansible.builtin.include_tasks: redpanda-health.yml
+
+- name: Drain, restart and return this broker to service
+  block:
+    - name: Drain this broker
+      ansible.builtin.command:
+        argv: [timeout, 900, rpk, cluster, maintenance, enable, "{{ harden_node_config.json.node_id }}", --wait]
+      changed_when: true
+
+    - name: Confirm cluster health after leadership drains
+      ansible.builtin.include_tasks: redpanda-health.yml
+
+    - name: Restart Redpanda with systemd
+      ansible.builtin.systemd:
+        name: redpanda
+        state: restarted
+      when: harden_restart_mode == 'systemd'
+
+    - name: Restart the lab container from the controller
+      ansible.builtin.command:
+        argv: [docker, restart, "{{ ansible_host }}"]
+      delegate_to: localhost
+      become: false
+      changed_when: true
+      when: harden_restart_mode == 'docker'
+
+    - name: Wait for local readiness
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/status/ready"
+      register: harden_ready
+      until: harden_ready.status | default(0) == 200 and harden_ready.json.status | default('') == 'ready'
+      retries: 60
+      delay: 15
+
+    - name: Wait for live membership
+      ansible.builtin.uri:
+        url: "{{ harden_admin_url }}/v1/brokers"
+      register: harden_membership
+      vars:
+        harden_this_broker: "{{ harden_membership.json | default([]) | selectattr('node_id', 'equalto', harden_node_config.json.node_id | int) | list }}"
+      until: >-
+        harden_this_broker | length == 1 and harden_this_broker[0].is_alive | default(false)
+        and harden_this_broker[0].membership_status == 'active'
+      retries: 60
+      delay: 15
+
+    - name: Return the restarted broker to service
+      ansible.builtin.command:
+        argv: [rpk, cluster, maintenance, disable, "{{ harden_node_config.json.node_id }}"]
+      changed_when: true
+
+  # A failed drain, restart or wait must not leave the broker in maintenance.
+  rescue:
+    - name: Take this broker out of maintenance after the failure
+      ansible.builtin.command:
+        argv: [rpk, cluster, maintenance, disable, "{{ harden_node_config.json.node_id }}"]
+      changed_when: true
+      failed_when: false
+
+    - name: Stop after the failed restart
+      ansible.builtin.fail:
+        msg: >-
+          Restart of {{ inventory_hostname }} failed ({{ ansible_failed_task.name }}); maintenance mode was
+          disabled. Check the broker and cluster health before rerunning --tags truststore.
+
+- name: Wait for full cluster recovery
+  ansible.builtin.include_tasks: redpanda-health.yml

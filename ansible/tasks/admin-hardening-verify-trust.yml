@@ -1,0 +1,28 @@
+---
+# Proves the admin truststore holds only the legacy admin CA, is loaded live by every
+# admin-trust listener, still verifies the node certificate for HTTPS and internode RPC,
+# and that the Kafka truststore did not change.
+- name: Report both trust files
+  ansible.builtin.include_tasks: admin-hardening-trust-report.yml
+
+- name: Require the legacy-only admin truststore and the unchanged Kafka truststore
+  ansible.builtin.assert:
+    that:
+      - harden_admin_trust.sha256 == harden_legacy_ca_sha256
+      - harden_admin_trust.certificates == [harden_legacy_ca_fingerprint]
+      - harden_kafka_trust.sha256 == harden_kafka_trust_before.sha256
+      - harden_shared_root_fingerprint in harden_kafka_trust.certificates
+
+- name: Require the node certificate to verify against the installed truststore
+  ansible.builtin.command:
+    argv: [openssl, verify, -x509_strict, -CAfile, "{{ harden_truststore }}", "{{ harden_certs_dir }}/node.crt"]
+  changed_when: false
+  check_mode: false
+
+- name: Require every admin-trust listener to run with the installed truststore
+  ansible.builtin.include_tasks: admin-hardening-wait-trust-crc.yml
+  vars:
+    harden_expected_crc32c: "{{ harden_admin_trust.crc32c }}"
+
+- name: Require a healthy cluster with complete replication
+  ansible.builtin.include_tasks: redpanda-health.yml

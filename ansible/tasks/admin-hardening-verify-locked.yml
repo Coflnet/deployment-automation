@@ -1,0 +1,50 @@
+---
+# Proves admin_api_require_auth on this broker: the node certificate alone (and so any
+# other certificate the admin truststore accepts) is refused privileged endpoints, while
+# readiness and both metrics endpoints stay open for Prometheus.
+- name: Read admin_api_require_auth with the admin login
+  ansible.builtin.uri:
+    url: "{{ harden_admin_url }}/v1/cluster_config?key=admin_api_require_auth"
+  register: harden_locked_config
+  check_mode: false
+  failed_when: harden_locked_config.status != 200 or not harden_locked_config.json.admin_api_require_auth | bool
+
+- name: Refuse privileged endpoints to a certificate without the admin login
+  ansible.builtin.uri:
+    url: "{{ harden_admin_url }}{{ item }}"
+    url_username: "{{ omit }}"
+    url_password: "{{ omit }}"
+    force_basic_auth: false
+    status_code: 403
+  loop:
+    - /v1/security/users
+    - /v1/cluster_config
+    - /v1/node_config
+  check_mode: false
+
+- name: Keep readiness and metrics open to a certificate without the admin login
+  ansible.builtin.uri:
+    url: "{{ harden_admin_url }}{{ item }}"
+    url_username: "{{ omit }}"
+    url_password: "{{ omit }}"
+    force_basic_auth: false
+  register: harden_open_endpoints
+  loop:
+    - /v1/status/ready
+    - /public_metrics
+    - /metrics
+  check_mode: false
+
+- name: Require Prometheus series on the public metrics endpoint
+  ansible.builtin.assert:
+    quiet: true
+    that:
+      - harden_open_endpoints.results[1].content is search('(?m)^redpanda_')
+
+- name: Read admin_api_require_auth through rpk
+  ansible.builtin.command:
+    argv: [rpk, cluster, config, get, admin_api_require_auth]
+  register: harden_rpk_require_auth
+  changed_when: false
+  check_mode: false
+  failed_when: harden_rpk_require_auth.rc != 0 or harden_rpk_require_auth.stdout | trim != 'true'

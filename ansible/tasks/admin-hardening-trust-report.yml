@@ -1,0 +1,14 @@
+---
+# Read-only: file sha256, Redpanda CRC32C and certificate fingerprints of both trust files.
+- name: Report both trust files
+  ansible.builtin.script:
+    cmd: "files/redpanda-trust-report.py {{ harden_truststore }} {{ harden_kafka_truststore }}"
+    executable: python3
+  register: harden_trust_report_raw
+  changed_when: false
+  check_mode: false
+
+- name: Keep the trust report
+  ansible.builtin.set_fact:
+    harden_admin_trust: "{{ (harden_trust_report_raw.stdout | from_json)[harden_truststore] }}"
+    harden_kafka_trust: "{{ (harden_trust_report_raw.stdout | from_json)[harden_kafka_truststore] }}"

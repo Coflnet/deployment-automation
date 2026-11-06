@@ -9,6 +9,9 @@ ansible/tls/ca
 ansible/tls/certs
 ansible/tls/ca_kafka
 hosts.ini
+# Admin API hardening (scripts/redpanda-admin): admin SASL password, scraper key
+/secrets/
+/clients/
 .DS_Store
 .idea/*
 aws/_override.tf
@@ -25,5 +28,3 @@ ansible/proxy/tls/**
 *.key
 # Kafka client material from scripts/kafka-client (keys, SCRAM passwords)
 /clients/
-# Admin password from scripts/redpanda-admin (admin API hardening)
-/secrets/

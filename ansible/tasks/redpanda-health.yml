@@ -7,6 +7,7 @@
     client_key: /etc/redpanda/certs/node.key
     return_content: true
   register: cluster_health
+  check_mode: false
   until: >-
     cluster_health.status | default(0) == 200
     and cluster_health.json.is_healthy | default(false)

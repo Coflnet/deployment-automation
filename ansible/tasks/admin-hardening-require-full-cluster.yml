@@ -1,0 +1,12 @@
+---
+# Every forward step acts on the whole cluster (the password and admin_api_require_auth are
+# cluster-wide), so a run limited to some brokers could lock out the others. Rollbacks may
+# use --limit. ansible_play_hosts_all is the full play target, also under serial: 1.
+- name: Refuse a run limited to part of the cluster
+  ansible.builtin.assert:
+    that:
+      - ansible_play_hosts_all | sort == groups['redpanda'] | sort
+    fail_msg: >-
+      This step must target all brokers {{ groups['redpanda'] | sort }}; the play targets
+      {{ ansible_play_hosts_all | sort }}. Drop --limit (rollbacks may use it).
+  run_once: true
